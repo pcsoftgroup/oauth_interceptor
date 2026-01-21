@@ -149,7 +149,9 @@ class OAuth extends Interceptor {
       }
       final dio = this.dio ?? Dio();
       try {
-        await dio.fetch(options).then((value) => handler.resolve(value));
+        await dio.fetch(options).then((value) {
+          handler.resolve(value);
+        });
       } on DioException catch (ex) {
         handler.next(ex);
       }

@@ -12,6 +12,8 @@ import '../utils/fake_secure_storage.dart';
 
 class MockRequestHandler extends Mock implements RequestInterceptorHandler {}
 
+class MockErrorHandler extends Mock implements ErrorInterceptorHandler {}
+
 void main() {
   group('OAuth', () {
     const tokenStorageKey = 'oauth-token';
@@ -44,6 +46,11 @@ void main() {
       );
     });
 
+    setUpAll(() {
+      registerFallbackValue(Response(requestOptions: RequestOptions()));
+      registerFallbackValue(DioException(requestOptions: RequestOptions()));
+    });
+
     Future<void> saveToken(DateTime expiresAt) async {
       await tokenStorage.write(key: tokenStorageKey, value: initialToken);
       await tokenStorage.write(
@@ -57,6 +64,403 @@ void main() {
     }
 
     group('Interceptor functions', () {
+      group('Refresh - Auth token past expiry date', () {
+        test('adds refreshed token request is successful', () async {
+          final options =
+              RequestOptions(path: '1', headers: <String, dynamic>{});
+          final expiresAt = DateTime(2020, 2);
+          await saveToken(expiresAt);
+          adapter.onPost(
+            'oauth/token',
+            (server) {
+              server.reply(
+                200,
+                <String, dynamic>{
+                  'access_token': nextToken,
+                  'expires_in': expirySeconds,
+                  'refresh_token': nextRefreshToken,
+                },
+              );
+            },
+            data: {
+              'grant_type': 'refresh_token',
+              'refresh_token': initialRefreshToken,
+              'client_id': 'id',
+              'client_secret': 'secret',
+            },
+          );
+
+          final handler = MockRequestHandler();
+
+          await oauth.onRequest(options, handler);
+
+          expect(
+            options.headers,
+            containsPair('Authorization', 'Bearer $nextToken'),
+          );
+          verify(() => handler.next(options)).called(1);
+          final signedIn = await oauth.isSignedIn;
+          expect(signedIn, isTrue);
+          final token = await oauth.token;
+          expect(token, nextToken);
+        });
+
+        test('request proceeds without auth if token refresh returns error',
+            () async {
+          final options =
+              RequestOptions(path: '1', headers: <String, dynamic>{});
+          final expiresAt = DateTime(2020, 2);
+          await saveToken(expiresAt);
+
+          adapter.onPost(
+            'oauth/token',
+            (server) {
+              server.reply(
+                400,
+                <String, dynamic>{'error_message': 'error'},
+              );
+            },
+            data: {
+              'grant_type': 'refresh_token',
+              'refresh_token': initialRefreshToken,
+              'client_id': 'id',
+              'client_secret': 'secret',
+            },
+          );
+
+          final handler = MockRequestHandler();
+          await oauth.onRequest(options, handler);
+
+          expect(options.headers.isEmpty, true);
+          final signedIn = await oauth.isSignedIn;
+          expect(signedIn, isFalse);
+          final token = await oauth.token;
+          expect(token, isNull);
+        });
+      });
+
+      group('Refresh - 401 error', () {
+        test('does nothing with non-401 errors', () async {
+          final options =
+              RequestOptions(path: '1', headers: <String, dynamic>{});
+          final handler = MockErrorHandler();
+          final ex = DioException(
+            requestOptions: options,
+            response: Response(requestOptions: options, statusCode: 400),
+          );
+          await oauth.onError(ex, handler);
+
+          verifyNever(() => handler.resolve(any()));
+          verify(() => handler.next(ex)).called(1);
+        });
+
+        test('adds new token and retries if refresh succeeds', () async {
+          final options =
+              RequestOptions(path: '1', headers: <String, dynamic>{});
+          final expiresAt = DateTime(2021, 2);
+          await saveToken(expiresAt);
+          adapter
+            ..onGet(
+              '1',
+              headers: {'Authorization': 'Bearer $nextToken'},
+              (server) {
+                server.reply(200, {});
+              },
+            )
+            ..onPost(
+              'oauth/token',
+              (server) {
+                server.reply(
+                  200,
+                  <String, dynamic>{
+                    'access_token': nextToken,
+                    'expires_in': expirySeconds,
+                    'refresh_token': nextRefreshToken,
+                  },
+                );
+              },
+              data: {
+                'grant_type': 'refresh_token',
+                'refresh_token': initialRefreshToken,
+                'client_id': 'id',
+                'client_secret': 'secret',
+              },
+            );
+
+          final handler = MockErrorHandler();
+
+          await oauth.onError(
+            DioException(
+              requestOptions: options,
+              response: Response(requestOptions: options, statusCode: 401),
+            ),
+            handler,
+          );
+
+          expect(
+            options.headers,
+            containsPair('Authorization', 'Bearer $nextToken'),
+          );
+          verify(() => handler.resolve(any())).called(1);
+          final signedIn = await oauth.isSignedIn;
+          expect(signedIn, isTrue);
+          final token = await oauth.token;
+          expect(token, nextToken);
+        });
+
+        test('retry clones FormData from the initial request', () async {
+          final originalData = FormData.fromMap({'1': 'a'})..finalize();
+          final options = RequestOptions(
+            path: '1',
+            headers: <String, dynamic>{},
+            data: originalData,
+            method: 'POST',
+          );
+          final expiresAt = DateTime(2021, 2);
+          await saveToken(expiresAt);
+          adapter
+            ..onPost(
+              '1',
+              headers: {'Authorization': 'Bearer $nextToken'},
+              data: originalData,
+              (server) {
+                server.reply(200, {});
+              },
+            )
+            ..onPost(
+              'oauth/token',
+              (server) {
+                server.reply(
+                  200,
+                  <String, dynamic>{
+                    'access_token': nextToken,
+                    'expires_in': expirySeconds,
+                    'refresh_token': nextRefreshToken,
+                  },
+                );
+              },
+              data: {
+                'grant_type': 'refresh_token',
+                'refresh_token': initialRefreshToken,
+                'client_id': 'id',
+                'client_secret': 'secret',
+              },
+            );
+
+          final handler = MockErrorHandler();
+
+          await oauth.onError(
+            DioException(
+              requestOptions: options,
+              response: Response(requestOptions: options, statusCode: 401),
+            ),
+            handler,
+          );
+
+          expect(
+            options.headers,
+            containsPair('Authorization', 'Bearer $nextToken'),
+          );
+          verify(
+            () => handler.resolve(
+              any(
+                that: isA<Response>().having(
+                  (res) => res.requestOptions.data,
+                  'request data',
+                  isA<FormData>()
+                      .having(
+                        (data) => data.hashCode,
+                        'isNotEqual',
+                        isNot(originalData.hashCode),
+                      )
+                      .having(
+                        (data) => data.fields,
+                        'fields',
+                        equals(originalData.fields),
+                      )
+                      .having(
+                        (data) => data.files,
+                        'files',
+                        equals(originalData.files),
+                      ),
+                ),
+              ),
+            ),
+          ).called(1);
+          final signedIn = await oauth.isSignedIn;
+          expect(signedIn, isTrue);
+          final token = await oauth.token;
+          expect(token, nextToken);
+        });
+
+        test('returns old error if token is null on retry', () async {
+          final options =
+              RequestOptions(path: '1', headers: <String, dynamic>{});
+          final expiresAt = DateTime(2021, 2);
+          await saveToken(expiresAt);
+          adapter
+            ..onGet(
+              '1',
+              headers: {'Authorization': 'Bearer $nextToken'},
+              (server) {
+                server.reply(200, {});
+              },
+            )
+            ..onPost(
+              'oauth/token',
+              (server) {
+                server.reply(
+                  200,
+                  <String, dynamic>{
+                    'access_token': null,
+                    'expires_in': expirySeconds,
+                    'refresh_token': nextRefreshToken,
+                  },
+                );
+              },
+              data: {
+                'grant_type': 'refresh_token',
+                'refresh_token': initialRefreshToken,
+                'client_id': 'id',
+                'client_secret': 'secret',
+              },
+            );
+
+          final handler = MockErrorHandler();
+
+          await oauth.onError(
+            DioException(
+              requestOptions: options,
+              response: Response(
+                requestOptions: options,
+                statusCode: 401,
+                statusMessage: 'Error!',
+              ),
+            ),
+            handler,
+          );
+          verifyNever(() => handler.resolve(any()));
+          verify(
+            () => handler.next(
+              any(
+                that: isA<DioException>().having(
+                  (ex) => ex.response?.statusMessage,
+                  'message',
+                  'Error!',
+                ),
+              ),
+            ),
+          ).called(1);
+          final signedIn = await oauth.isSignedIn;
+          expect(signedIn, isFalse);
+          final token = await oauth.token;
+          expect(token, isNull);
+        });
+
+        test('returns new error if retry fails', () async {
+          final options =
+              RequestOptions(path: '1', headers: <String, dynamic>{});
+          final expiresAt = DateTime(2021, 2);
+          await saveToken(expiresAt);
+          adapter
+            ..onGet(
+              '1',
+              headers: {'Authorization': 'Bearer $nextToken'},
+              (server) {
+                server.reply(400, {}, statusMessage: 'Error!');
+              },
+            )
+            ..onPost(
+              'oauth/token',
+              (server) {
+                server.reply(
+                  200,
+                  <String, dynamic>{
+                    'access_token': nextToken,
+                    'expires_in': expirySeconds,
+                    'refresh_token': nextRefreshToken,
+                  },
+                );
+              },
+              data: {
+                'grant_type': 'refresh_token',
+                'refresh_token': initialRefreshToken,
+                'client_id': 'id',
+                'client_secret': 'secret',
+              },
+            );
+
+          final handler = MockErrorHandler();
+
+          await oauth.onError(
+            DioException(
+              requestOptions: options,
+              response: Response(requestOptions: options, statusCode: 401),
+            ),
+            handler,
+          );
+
+          expect(
+            options.headers,
+            containsPair('Authorization', 'Bearer $nextToken'),
+          );
+          verify(
+            () => handler.next(
+              any(
+                that: isA<DioException>().having(
+                  (ex) => ex.response?.statusMessage,
+                  'message',
+                  'Error!',
+                ),
+              ),
+            ),
+          ).called(1);
+          final signedIn = await oauth.isSignedIn;
+          expect(signedIn, isTrue);
+          final token = await oauth.token;
+          expect(token, nextToken);
+        });
+
+        test('returns original error if refresh fails', () async {
+          final options =
+              RequestOptions(path: '1', headers: <String, dynamic>{});
+          final expiresAt = DateTime(2021, 2);
+          await saveToken(expiresAt);
+
+          adapter.onPost(
+            'oauth/token',
+            (server) {
+              server.reply(
+                400,
+                <String, dynamic>{'error_message': 'error'},
+              );
+            },
+            data: {
+              'grant_type': 'refresh_token',
+              'refresh_token': initialRefreshToken,
+              'client_id': 'id',
+              'client_secret': 'secret',
+            },
+          );
+
+          final handler = MockErrorHandler();
+          final ex = DioException(
+            requestOptions: options,
+            response: Response(requestOptions: options, statusCode: 401),
+          );
+          await oauth.onError(ex, handler);
+
+          verifyNever(() => handler.resolve(any()));
+          verify(() => handler.next(ex)).called(1);
+
+          expect(options.headers.isEmpty, true);
+          final signedIn = await oauth.isSignedIn;
+          expect(signedIn, isFalse);
+          final token = await oauth.token;
+          expect(token, isNull);
+        });
+      });
+
       test('adds user token if one is present and has not expired', () async {
         final options = RequestOptions(path: '1', headers: <String, dynamic>{});
 
@@ -93,78 +497,6 @@ void main() {
           isNot(contains('Authorization')),
         );
         verify(() => handler.next(options)).called(1);
-        final signedIn = await oauth.isSignedIn;
-        expect(signedIn, isFalse);
-        final token = await oauth.token;
-        expect(token, isNull);
-      });
-
-      test('adds refreshed token if refresh is successful', () async {
-        final options = RequestOptions(path: '1', headers: <String, dynamic>{});
-        final expiresAt = DateTime(2020, 2);
-        await saveToken(expiresAt);
-        adapter.onPost(
-          'oauth/token',
-          (server) {
-            server.reply(
-              200,
-              <String, dynamic>{
-                'access_token': nextToken,
-                'expires_in': expirySeconds,
-                'refresh_token': nextRefreshToken,
-              },
-            );
-          },
-          data: {
-            'grant_type': 'refresh_token',
-            'refresh_token': initialRefreshToken,
-            'client_id': 'id',
-            'client_secret': 'secret',
-          },
-        );
-
-        final handler = MockRequestHandler();
-
-        await oauth.onRequest(options, handler);
-
-        expect(
-          options.headers,
-          containsPair('Authorization', 'Bearer $nextToken'),
-        );
-        verify(() => handler.next(options)).called(1);
-        final signedIn = await oauth.isSignedIn;
-        expect(signedIn, isTrue);
-        final token = await oauth.token;
-        expect(token, nextToken);
-      });
-
-      test('return error if token refresh returns error', () async {
-        final options = RequestOptions(path: '1', headers: <String, dynamic>{});
-        final expiresAt = DateTime(2020, 2);
-        await saveToken(expiresAt);
-
-        adapter.onPost(
-          'oauth/token',
-          (server) {
-            server.reply(
-              400,
-              <String, dynamic>{'error_message': 'error'},
-            );
-          },
-          data: {
-            'grant_type': 'refresh_token',
-            'refresh_token': initialRefreshToken,
-            'client_id': 'id',
-            'client_secret': 'secret',
-          },
-        );
-
-        final handler = MockRequestHandler();
-
-        await expectLater(
-          oauth.onRequest(options, handler),
-          throwsA(isA<DioException>()),
-        );
         final signedIn = await oauth.isSignedIn;
         expect(signedIn, isFalse);
         final token = await oauth.token;
