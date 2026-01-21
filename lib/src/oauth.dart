@@ -42,7 +42,13 @@ class OAuth extends Interceptor {
       );
 
       if (expiresAt.isBefore(clock.now())) {
-        await refresh();
+        try {
+          await refresh();
+        } on DioException {
+          // If refresh fails then log out, and allow the request to 401
+          await logout();
+          return super.onRequest(options, handler);
+        }
       }
     }
 
@@ -52,6 +58,21 @@ class OAuth extends Interceptor {
       options.headers['Authorization'] = 'Bearer $token';
     }
     return super.onRequest(options, handler);
+  }
+
+  @override
+  Future<void> onError(
+      DioException err, ErrorInterceptorHandler handler) async {
+    if (err.response?.statusCode == 401) {
+      try {
+        await refresh();
+        await _retry(err, handler);
+      } on DioException {
+        super.onError(err, handler);
+      }
+    } else {
+      super.onError(err, handler);
+    }
   }
 
   Future<void> login(OAuthGrantType grant) async {
@@ -112,5 +133,28 @@ class OAuth extends Interceptor {
     await storage.delete(key: '$name-token');
     await storage.delete(key: '$name-refresh-token');
     await storage.delete(key: '$name-expires-at');
+  }
+
+  Future<void> _retry(
+    DioException err,
+    ErrorInterceptorHandler handler,
+  ) async {
+    final token = await storage.read(key: '$name-token');
+
+    if (token != null) {
+      final options = err.requestOptions
+        ..headers['Authorization'] = 'Bearer $token';
+      if (options.data is FormData) {
+        options.data = (options.data as FormData).clone();
+      }
+      final dio = this.dio ?? Dio();
+      try {
+        await dio.fetch(options).then((value) => handler.resolve(value));
+      } on DioException catch (ex) {
+        handler.next(ex);
+      }
+    } else {
+      handler.next(err);
+    }
   }
 }
