@@ -65,3 +65,7 @@ class CustomGrantType implements OAuthGrantType {
     }
 }
 ```
+
+### Interceptor flowchart
+
+![Flow chart showing interceptor logic](documentation/request_flow.drawio.svg)
