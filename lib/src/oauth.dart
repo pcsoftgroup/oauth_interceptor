@@ -4,6 +4,11 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:oauth_interceptor/src/oauth_grant_type.dart';
 import 'package:time/time.dart';
 
+typedef InvalidTokenCallback = Function(
+  RequestOptions options,
+  RequestInterceptorHandler handler,
+);
+
 class OAuth extends Interceptor {
   OAuth({
     required this.tokenUrl,
@@ -13,15 +18,41 @@ class OAuth extends Interceptor {
     this.name = 'oauth',
     this.clock = const Clock(),
     this.storage = const FlutterSecureStorage(),
+    this.onInvalidToken,
   });
 
+  /// The oauth url of your API
   final String tokenUrl;
+
+  /// The client ID required to request a login
   final String clientId;
+
+  /// The client secret required to request a login
   final String clientSecret;
+
+  /// The name of this OAuth setup, used to save and fetch data.
+  /// This allows you to have multiple OAuth setups without clashing,
+  /// as long as they have different names.
   final String name;
+
+  /// The Dio instance that will be used to request login
+  /// or to retry a request after a token refresh.
   final Dio? dio;
+
+  /// Pass in a Clock instance to set the "current time" -
+  /// mostly useful for testing.
   final Clock clock;
+
+  /// The FlutterSecureStorage instance that will store authorization data
+  /// between sessions.
   final FlutterSecureStorage storage;
+
+  /// Set this to override what happens if there is no token found in storage,
+  /// or if an attempt to refresh a token fails.
+  /// The user will probably need to log in again from the start.
+  /// The default behaviour is to proceed with the request without setting
+  /// the auth header - usually leading to a 401 response.
+  final InvalidTokenCallback? onInvalidToken;
 
   Future<bool> get isSignedIn async {
     final token = await storage.read(key: '$name-token');
@@ -45,9 +76,17 @@ class OAuth extends Interceptor {
         try {
           await refresh();
         } on DioException {
-          // If refresh fails then log out, and allow the request to 401
+          // If refresh fails then log out
           await logout();
-          return super.onRequest(options, handler);
+          if (onInvalidToken != null) {
+            // If invalid token callback is set then call that
+            onInvalidToken?.call(options, handler);
+            return;
+          } else {
+            // Otherwise default to proceeding with the request
+            // and likely receiving 401
+            return super.onRequest(options, handler);
+          }
         }
       }
     }
@@ -56,6 +95,11 @@ class OAuth extends Interceptor {
 
     if (token != null) {
       options.headers['Authorization'] = 'Bearer $token';
+    } else if (onInvalidToken != null) {
+      // If we have no token and we have a custom callback for invalid tokens,
+      // then call that.
+      onInvalidToken?.call(options, handler);
+      return;
     }
     return super.onRequest(options, handler);
   }
