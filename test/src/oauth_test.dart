@@ -1,4 +1,6 @@
 // 📦 Package imports:
+import 'dart:async';
+
 import 'package:clock/clock.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -105,7 +107,53 @@ void main() {
           expect(token, nextToken);
         });
 
-        test('request proceeds without auth if token refresh returns error',
+        test('onInvalidToken called if present and token refresh returns error',
+            () async {
+          final options =
+              RequestOptions(path: '1', headers: <String, dynamic>{});
+          final expiresAt = DateTime(2020, 2);
+          await saveToken(expiresAt);
+          final callback = Completer();
+          final callbackOauth = OAuth(
+            tokenUrl: 'oauth/token',
+            clientId: 'id',
+            clientSecret: 'secret',
+            dio: dio,
+            clock: clock,
+            storage: tokenStorage,
+            onInvalidToken: callback.complete,
+          );
+
+          adapter.onPost(
+            'oauth/token',
+            (server) {
+              server.reply(
+                400,
+                <String, dynamic>{'error_message': 'error'},
+              );
+            },
+            data: {
+              'grant_type': 'refresh_token',
+              'refresh_token': initialRefreshToken,
+              'client_id': 'id',
+              'client_secret': 'secret',
+            },
+          );
+
+          final handler = MockRequestHandler();
+          await callbackOauth.onRequest(options, handler);
+
+          expect(callback.isCompleted, true);
+
+          expect(options.headers.isEmpty, true);
+          final signedIn = await callbackOauth.isSignedIn;
+          expect(signedIn, isFalse);
+          final token = await callbackOauth.token;
+          expect(token, isNull);
+        });
+
+        test(
+            '''request proceeds without auth if token refresh returns error and no onInvalidToken''',
             () async {
           final options =
               RequestOptions(path: '1', headers: <String, dynamic>{});
@@ -421,7 +469,59 @@ void main() {
           expect(token, nextToken);
         });
 
-        test('returns original error if refresh fails', () async {
+        test('calls onInvalidToken if present and if refresh fails', () async {
+          final options =
+              RequestOptions(path: '1', headers: <String, dynamic>{});
+          final expiresAt = DateTime(2021, 2);
+          await saveToken(expiresAt);
+          final callback = Completer();
+          final callbackOauth = OAuth(
+            tokenUrl: 'oauth/token',
+            clientId: 'id',
+            clientSecret: 'secret',
+            dio: dio,
+            clock: clock,
+            storage: tokenStorage,
+            onInvalidToken: callback.complete,
+          );
+
+          adapter.onPost(
+            'oauth/token',
+            (server) {
+              server.reply(
+                400,
+                <String, dynamic>{'error_message': 'error'},
+              );
+            },
+            data: {
+              'grant_type': 'refresh_token',
+              'refresh_token': initialRefreshToken,
+              'client_id': 'id',
+              'client_secret': 'secret',
+            },
+          );
+
+          final handler = MockErrorHandler();
+          final ex = DioException(
+            requestOptions: options,
+            response: Response(requestOptions: options, statusCode: 401),
+          );
+          await callbackOauth.onError(ex, handler);
+
+          verifyNever(() => handler.resolve(any()));
+          verifyNever(() => handler.next(ex));
+
+          expect(callback.isCompleted, isTrue);
+
+          expect(options.headers.isEmpty, true);
+          final signedIn = await callbackOauth.isSignedIn;
+          expect(signedIn, isFalse);
+          final token = await callbackOauth.token;
+          expect(token, isNull);
+        });
+
+        test('returns original error if refresh fails and no onInvalidToken',
+            () async {
           final options =
               RequestOptions(path: '1', headers: <String, dynamic>{});
           final expiresAt = DateTime(2021, 2);
@@ -483,23 +583,55 @@ void main() {
         expect(token, initialToken);
       });
 
-      test('adds nothing if no token is present', () async {
+      test(
+        'adds nothing if no token is present and onInvalidToken not set',
+        () async {
+          final options =
+              RequestOptions(path: '1', headers: <String, dynamic>{});
+
+          await tokenStorage.deleteAll();
+
+          final handler = MockRequestHandler();
+
+          await oauth.onRequest(options, handler);
+
+          expect(
+            options.headers,
+            isNot(contains('Authorization')),
+          );
+          verify(() => handler.next(options)).called(1);
+          final signedIn = await oauth.isSignedIn;
+          expect(signedIn, isFalse);
+          final token = await oauth.token;
+          expect(token, isNull);
+        },
+      );
+
+      test('calls onInvalidToken if no token is present', () async {
         final options = RequestOptions(path: '1', headers: <String, dynamic>{});
+        final callback = Completer();
+        final callbackOauth = OAuth(
+          tokenUrl: 'oauth/token',
+          clientId: 'id',
+          clientSecret: 'secret',
+          dio: dio,
+          clock: clock,
+          storage: tokenStorage,
+          onInvalidToken: callback.complete,
+        );
 
         await tokenStorage.deleteAll();
 
         final handler = MockRequestHandler();
 
-        await oauth.onRequest(options, handler);
+        await callbackOauth.onRequest(options, handler);
 
-        expect(
-          options.headers,
-          isNot(contains('Authorization')),
-        );
-        verify(() => handler.next(options)).called(1);
-        final signedIn = await oauth.isSignedIn;
+        expect(callback.isCompleted, true);
+
+        verifyNever(() => handler.next(options));
+        final signedIn = await callbackOauth.isSignedIn;
         expect(signedIn, isFalse);
-        final token = await oauth.token;
+        final token = await callbackOauth.token;
         expect(token, isNull);
       });
     });
