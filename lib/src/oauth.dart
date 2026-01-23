@@ -4,10 +4,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:oauth_interceptor/src/oauth_grant_type.dart';
 import 'package:time/time.dart';
 
-typedef InvalidTokenCallback = Function(
-  RequestOptions options,
-  RequestInterceptorHandler handler,
-);
+typedef InvalidTokenCallback = Function(RequestOptions options);
 
 class OAuth extends Interceptor {
   OAuth({
@@ -80,7 +77,7 @@ class OAuth extends Interceptor {
           await logout();
           if (onInvalidToken != null) {
             // If invalid token callback is set then call that
-            onInvalidToken?.call(options, handler);
+            onInvalidToken?.call(options);
             return;
           } else {
             // Otherwise default to proceeding with the request
@@ -98,7 +95,7 @@ class OAuth extends Interceptor {
     } else if (onInvalidToken != null) {
       // If we have no token and we have a custom callback for invalid tokens,
       // then call that.
-      onInvalidToken?.call(options, handler);
+      onInvalidToken?.call(options);
       return;
     }
     return super.onRequest(options, handler);
@@ -106,13 +103,19 @@ class OAuth extends Interceptor {
 
   @override
   Future<void> onError(
-      DioException err, ErrorInterceptorHandler handler) async {
+    DioException err,
+    ErrorInterceptorHandler handler,
+  ) async {
     if (err.response?.statusCode == 401) {
       try {
         await refresh();
         await _retry(err, handler);
       } on DioException {
-        super.onError(err, handler);
+        if (onInvalidToken != null) {
+          onInvalidToken?.call(err.requestOptions);
+        } else {
+          super.onError(err, handler);
+        }
       }
     } else {
       super.onError(err, handler);
