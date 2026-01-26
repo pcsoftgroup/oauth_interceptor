@@ -1,3 +1,8 @@
+## 2.3.0
+
+- Token refresh failures no longer throw an exception
+- Refresh is automatically called when a 401 is recieved
+
 ## 2.2.1
 
 - Updated flutter_secure_storage to 9.2.4
